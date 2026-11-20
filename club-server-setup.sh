@@ -23,6 +23,9 @@ ask()  { local a; read -r -p "$1 " a </dev/tty; echo "$a"; }
 FAILS=0
 
 [ "$(id -u)" = "0" ] || die "Run it with sudo:  sudo bash club-server-setup.sh"
+# A Proxmox container (LXC) works too, as long as it is a PRIVILEGED container. That is checked in step 2.
+LXC=0
+[ "$(systemd-detect-virt 2>/dev/null || true)" = "lxc" ] && LXC=1
 . /etc/os-release
 case "${ID:-}-${VERSION_ID:-}" in
   ubuntu-24.04|debian-13) ;;
@@ -68,6 +71,35 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q samba winbind krb5-user smbclient ldb-tools dnsutils acl attr chrony ufw openssl >/dev/null
 ok "software installed ($(samba --version))"
+
+# Can this machine store Windows file permissions? The account server cannot work without it.
+T="/var/lib/samba/.club-check.$$"
+mkdir -p /var/lib/samba && : > "$T"
+XOK=0; AOK=0
+setfattr -n security.NTACL -v test "$T" 2>/dev/null && XOK=1
+setfacl -m u:nobody:r "$T" 2>/dev/null && AOK=1
+rm -f "$T"
+if [ "$XOK" != "1" ] || [ "$AOK" != "1" ]; then
+  echo
+  printf '\033[1;31mSTOPPED: this machine cannot store Windows file permissions, so the account server would not work.\033[0m\n'
+  if [ "$LXC" = "1" ]; then
+    echo "This is a Proxmox container, and it has to be a PRIVILEGED one with ACLs switched on."
+    echo "Nothing has been changed yet. To fix it, in Proxmox:"
+    [ "$XOK" = "1" ] || echo "  1. Back this container up (Backup > Backup now), then Restore it with 'Unprivileged container' UNTICKED."
+    [ "$XOK" = "1" ] || echo "     (Or delete it and create it again with 'Unprivileged container' unticked on the first screen.)"
+    [ "$AOK" = "1" ] || echo "  2. Container > Resources > Root Disk > Edit > Advanced > set ACLs to 'Enabled', then restart the container."
+    echo "Then run this file again."
+  else
+    echo "The disk this machine is on does not allow extended attributes or ACLs."
+  fi
+  exit 1
+fi
+ok "this machine can store Windows file permissions"
+if [ "$LXC" = "1" ]; then
+  # Stop Proxmox from rewriting these files each time the container starts.
+  touch /etc/.pve-ignore.hosts /etc/.pve-ignore.resolv.conf /etc/.pve-ignore.hostname
+  ok "running in a Proxmox container (privileged) - adjusted for that"
+fi
 
 # ---------- 3. Name and fixed address ----------
 say "3 of 7  Giving the server its name and a fixed address"
@@ -117,7 +149,10 @@ done
 ok "account service is running"
 
 # Keep the address fixed from now on (the laptops will look for the server at this address).
-if ! grep -qs "club-static" /etc/netplan/99-club-static.yaml 2>/dev/null; then
+if [ "$LXC" = "1" ] || ! command -v netplan >/dev/null 2>&1 || [ ! -d /etc/netplan ]; then
+  STATIC_NOTE="In Proxmox: this container > Network > eth0 > Edit > IPv4 'Static', address $IP/$PREFIX, gateway $GATEWAY. Do this now so the address can never change."
+  echo "  NOTE: $STATIC_NOTE"
+elif ! grep -qs "club-static" /etc/netplan/99-club-static.yaml 2>/dev/null; then
   cat > /etc/netplan/99-club-static.yaml <<EOF
 # club-static: written by club-server-setup.sh
 network:
@@ -165,20 +200,30 @@ if ! grep -qs "club-server-setup" /etc/chrony/chrony.conf; then
     echo "ntpsigndsocket /var/lib/samba/ntp_signd"
   } >> /etc/chrony/chrony.conf
 fi
+if [ "$LXC" = "1" ]; then
+  # A container cannot set the clock (the Proxmox host does that), but it can still hand the time to the laptops.
+  mkdir -p /etc/systemd/system/chrony.service.d
+  printf '[Unit]\nConditionCapability=\n' > /etc/systemd/system/chrony.service.d/club.conf
+  if [ -f /etc/default/chrony ] && ! grep -q -- "-x" /etc/default/chrony; then
+    sed -i 's/^DAEMON_OPTS="\(.*\)"/DAEMON_OPTS="\1 -x"/' /etc/default/chrony
+  fi
+  systemctl daemon-reload
+fi
 systemctl restart chrony >/dev/null 2>&1 || systemctl restart chronyd >/dev/null 2>&1 || true
-ok "this server now gives the time to the laptops"
+if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet chronyd 2>/dev/null; then ok "this server now gives the time to the laptops"
+else echo "  NOTE: the time service did not start. Laptops will keep their own clocks; tell Claude if sign-ins start failing with clock errors."; fi
 
 # ---------- 7. Firewall ----------
 say "7 of 7  Firewall: only the laptop network can reach the account service"
-ufw --force reset >/dev/null
-ufw default deny incoming >/dev/null
-ufw default allow outgoing >/dev/null
-ufw allow 22/tcp >/dev/null
-for rule in 53/tcp 53/udp 88/tcp 88/udp 123/udp 135/tcp 137/udp 138/udp 139/tcp 389/tcp 389/udp 445/tcp 464/tcp 464/udp 636/tcp 3268/tcp 3269/tcp 49152:65535/tcp; do
-  ufw allow from "$ALLOW_FROM" to any port "${rule%/*}" proto "${rule#*/}" >/dev/null
-done
-ufw --force enable >/dev/null
-ok "firewall is on"
+if ( ufw --force reset >/dev/null 2>&1 && ufw default deny incoming >/dev/null 2>&1 && ufw default allow outgoing >/dev/null 2>&1 && ufw allow 22/tcp >/dev/null 2>&1 ); then
+  for rule in 53/tcp 53/udp 88/tcp 88/udp 123/udp 135/tcp 137/udp 138/udp 139/tcp 389/tcp 389/udp 445/tcp 464/tcp 464/udp 636/tcp 3268/tcp 3269/tcp 49152:65535/tcp; do
+    ufw allow from "$ALLOW_FROM" to any port "${rule%/*}" proto "${rule#*/}" >/dev/null 2>&1 || true
+  done
+  if ufw --force enable >/dev/null 2>&1; then ok "firewall is on"
+  else echo "  NOTE: the firewall could not be switched on inside this machine. Use the Proxmox firewall for this container instead."; fi
+else
+  echo "  NOTE: the firewall could not be set up inside this machine. Use the Proxmox firewall for this container instead."
+fi
 
 # ---------- Checks ----------
 say "CHECKING IT ALL WORKS"
@@ -206,4 +251,5 @@ fi
 echo "  Server address:  $IP      Domain: $REALM"
 echo "  The administrator password is saved ON THIS SERVER ONLY, in $SECRETS"
 echo "  (see it with:  sudo cat $SECRETS ).  Put it in your password manager."
+[ -n "${STATIC_NOTE:-}" ] && printf '\033[1;33m  DO THIS NOW: %s\033[0m\n' "$STATIC_NOTE"
 echo "  Nothing on any laptop has changed yet. Next step: student file storage, sign-ups and the admin page."

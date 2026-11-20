@@ -165,7 +165,7 @@ EOF
 systemctl daemon-reload
 systemctl enable club.service >/dev/null 2>&1
 systemctl restart club.service
-ufw allow from "$ALLOW_FROM" to any port "$PORT" proto tcp >/dev/null
+ufw allow from "$ALLOW_FROM" to any port "$PORT" proto tcp >/dev/null 2>&1 || echo "  NOTE: could not open port $PORT in this machine's firewall (fine if the firewall is off or handled by Proxmox)."
 ok "program installed and started"
 
 # Nightly backup of every account and the admin page's data (kept 14 days), and automatic security updates.
